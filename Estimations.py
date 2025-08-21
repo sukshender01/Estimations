@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import io
 import re
 import math
+import random
 from datetime import datetime
 from typing import List, Dict, Tuple
 
-# Optional: file readers & PDF export
+# Optional file readers & PDF
 try:
     import docx  # python-docx
 except Exception:
@@ -18,18 +18,15 @@ try:
 except Exception:
     PyPDF2 = None
 
-try:
-    from fpdf import FPDF
-except Exception:
-    FPDF = None
+# ReportLab for robust PDF export
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
-# Optional: lightweight NLP (auto-fallback if not available)
-HF_OK = False
-try:
-    from transformers import pipeline
-    HF_OK = True
-except Exception:
-    HF_OK = False
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # -------------------- STREAMLIT CONFIG & THEME --------------------
 st.set_page_config(page_title="Effort Estimation AI Tool", layout="wide")
@@ -42,9 +39,7 @@ st.markdown("""
   color: #1d1d1f;
   font-family: "Inter", "Segoe UI", Tahoma, sans-serif;
 }
-/* Panels */
-.block-container { padding-top: 1.2rem; }
-/* Cards */
+.block-container { padding-top: 1.0rem; }
 .card {
   background: #fff6d6;
   border: 1px solid #f2c766;
@@ -52,50 +47,23 @@ st.markdown("""
   padding: 1rem 1.2rem;
   box-shadow: 0 6px 16px rgba(0,0,0,0.08);
 }
-/* Headers & badges */
 h1, h2, h3 { color: #0b3d91; font-weight: 800; }
 .badge {
-  display: inline-block;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: #003366;
-  color: #fff;
-  font-size: 0.8rem;
-  font-weight: 700;
-  margin-right: 6px;
+  display: inline-block; padding: 4px 10px; border-radius: 999px;
+  background: #003366; color: #fff; font-size: 0.8rem; font-weight: 700; margin-right: 6px;
 }
-/* Metrics */
 .metric-box {
-  background: #fff3bf;
-  border: 1px dashed #e0a800;
-  border-radius: 12px;
-  padding: 14px;
-  text-align: center;
-}
-/* Inputs & buttons */
-.stButton > button {
-  background: #0b5ed7;
-  color: #fff;
-  border: none;
-  border-radius: 10px;
-  font-weight: 700;
-  padding: 0.6rem 1rem;
-}
-.stDownloadButton > button {
-  background: #0b3d91 !important;
-  color: #fff !important;
-  border-radius: 10px !important;
-  font-weight: 700 !important;
+  background: #fff3bf; border: 1px dashed #e0a800; border-radius: 12px;
+  padding: 14px; text-align: center;
 }
 hr { border: none; height: 1px; background: #f0c36d; margin: 10px 0 6px; }
+.help-btn button { width: 100%; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📊 Effort Estimation AI Tool")
 
-# =========================================================
-# ===================== HELPERS ===========================
-# =========================================================
+# -------------------- HELPERS --------------------
 def read_document(file) -> str:
     """Read text from txt, docx, pdf with graceful degradation."""
     if file is None:
@@ -118,75 +86,55 @@ def read_document(file) -> str:
     return ""
 
 def basic_feature_split(text: str) -> List[str]:
-    """Fast heuristic to split requirements into features."""
+    """Heuristic to split requirements into features."""
     chunks = re.split(r"(?:\n\s*[-•*]\s+|\n{2,}|;\s*|\.\s+)", text)
     features = [c.strip() for c in chunks if c and len(c.strip()) >= 6]
-    # de-duplicate while preserving order
     seen, unique = set(), []
     for f in features:
-        if f not in seen:
+        key = re.sub(r"\s+", " ", f.lower())
+        if key not in seen:
             unique.append(f)
-            seen.add(f)
+            seen.add(key)
     return unique[:200]
 
-# ---------- AI-based (optional) complexity per feature ----------
-@st.cache_resource(show_spinner=False)
-def get_ai_complexity_classifier():
+def classify_complexity(feature: str) -> Tuple[str, int, str]:
     """
-    Try to load a small local transformer pipeline for zero-shot classification.
-    If not available or fails, return None (we will fallback to heuristic).
+    Classify feature complexity and map to story points with a short rationale.
+    Returns: (complexity, story_points, rationale)
     """
-    if not HF_OK:
-        return None
-    try:
-        # small-ish NLI model; if host can't download, we'll fallback gracefully
-        clf = pipeline("zero-shot-classification", model="valhalla/distilbart-mnli-12-1")
-        return clf
-    except Exception:
-        return None
-
-AI_CLF = get_ai_complexity_classifier()
-
-def ai_complexity_score(feature: str) -> Tuple[str, int, str]:
-    """
-    AI-based complexity classification with fallback heuristic.
-    Returns: (class, story_points, rationale)
-    """
-    labels = ["Low", "Medium", "High"]
-    rationale = []
-    if AI_CLF:
-        try:
-            res = AI_CLF(
-                feature,
-                candidate_labels=labels,
-                hypothesis_template="This feature has {label} implementation complexity."
-            )
-            # Pick best label
-            label = res["labels"][0]
-            score = float(res["scores"][0])
-            rationale.append(f"AI zero-shot classified as {label} (confidence {round(score*100,1)}%).")
-            sp = {"Low": 3, "Medium": 5, "High": 8}[label]
-            return label, sp, " ".join(rationale)
-        except Exception:
-            pass
-
-    # Heuristic fallback
     f = feature.lower()
+    rationale = []
     high_kw = ["integration", "payment", "gateway", "sso", "oauth", "kafka", "stream", "etl",
-               "ml", "ai", "analytics", "realtime", "scale", "security", "encryption",
+               "ml", "ai", "analytics", "realtime", "scalab", "security", "encryption",
                "compliance", "migration", "microservice", "kubernetes", "distributed",
                "multi-tenant", "observability"]
-    low_kw = ["ui", "form", "page", "static", "list", "search", "filter", "report",
-              "export", "crud", "login", "signup", "profile", "email", "notification"]
+    low_kw = ["ui", "form", "page", "static", "list", "search", "filter", "report", "export",
+              "crud", "login", "signup", "profile", "email", "notification"]
+
     is_high = any(k in f for k in high_kw)
     is_low  = any(k in f for k in low_kw)
+
+    complexity, sp = "Medium", 5
     if is_high and not is_low:
-        rationale.append("Keyword heuristic indicates complex integration/AI/security/scale.")
-        return "High", 8, " ".join(rationale)
-    if is_low and not is_high:
-        rationale.append("Keyword heuristic indicates bounded UI/CRUD/reporting.")
-        return "Low", 3, " ".join(rationale)
-    return "Medium", 5, "Default heuristic (no strong signals)."
+        complexity, sp = "High", 8
+        rationale.append("High-risk keywords (integration/AI/security/scale).")
+    elif is_low and not is_high:
+        complexity, sp = "Low", 3
+        rationale.append("UI/CRUD-oriented and bounded scope.")
+    elif is_high and is_low:
+        complexity, sp = "High", 8
+        rationale.append("UI + complex backend integration.")
+    else:
+        complexity, sp = "Medium", 5
+        rationale.append("No strong signals; average scope.")
+
+    vague = ["etc", "optimize", "improve", "efficient", "user-friendly", "robust"]
+    if any(v in f for v in vague) and complexity != "High":
+        sp += 2
+        rationale.append("Ambiguity increases estimate.")
+
+    sp = min(sp, 13)
+    return complexity, sp, " ".join(rationale)
 
 def categorize_feature(feature: str) -> str:
     f = feature.lower()
@@ -194,480 +142,448 @@ def categorize_feature(feature: str) -> str:
              "reliability", "observability", "monitor", "backup", "sla", "scalab", "devops"]
     return "Non-Functional" if any(k in f for k in nf_kw) else "Functional"
 
-# ---------- Classical technique implementations ----------
-def estimate_cocomo(features: List[str], avg_loc_per_feature: int, mode: str = "organic") -> Dict:
-    """
-    Basic COCOMO effort (person-months) from KLOC with multipliers by mode.
-    Returns dict with effort PM, hours, KLOC and params used.
-    """
-    loc = max(1, avg_loc_per_feature) * max(0, len(features))
-    kloc = loc / 1000.0
-
-    # mode params (Basic COCOMO 81)
-    params = {
-        "organic": (2.4, 1.05),
-        "semi-detached": (3.0, 1.12),
-        "embedded": (3.6, 1.20),
-    }
-    a, b = params.get(mode, params["organic"])
-
-    pm = a * (kloc ** b)  # effort in person-months
-    hours = pm * 152  # ~19 wd * 8h
-    return {
-        "KLOC": round(kloc, 2),
-        "PM": round(pm, 2),
-        "Hours": round(hours, 1),
-        "Mode": mode,
-        "a": a, "b": b,
-        "avg_loc_per_feature": avg_loc_per_feature,
-        "features": len(features)
-    }
-
-def estimate_function_points(features: List[str],
-                             ei=10, eo=6, eq=4, ilf=5, eif=3,
-                             vaf=1.0, hours_per_fp=8.0) -> Dict:
-    """
-    Simplified FP: approximate counts from features + user overrides.
-    UFP = 4*EI + 5*EO + 4*EQ + 10*ILF + 7*EIF (weights simplified here via inputs)
-    Effort hours = FP * hours_per_fp * VAF
-    """
-    n = len(features)
-    # naive apportioning from features if the user didn't change defaults
-    est_ei  = max(1, int(n * 0.35)) if ei == 10 else ei
-    est_eo  = max(1, int(n * 0.25)) if eo == 6  else eo
-    est_eq  = max(1, int(n * 0.15)) if eq == 4  else eq
-    est_ilf = max(1, int(n * 0.15)) if ilf == 5 else ilf
-    est_eif = max(1, int(n * 0.10)) if eif == 3 else eif
-
-    # weighted UFP (using typical mid weights)
-    ufp = (est_ei*4) + (est_eo*5) + (est_eq*4) + (est_ilf*10) + (est_eif*7)
-    fp = ufp * vaf
-    hours = fp * hours_per_fp
-
-    return {
-        "EI": est_ei, "EO": est_eo, "EQ": est_eq, "ILF": est_ilf, "EIF": est_eif,
-        "UFP": round(ufp, 2),
-        "VAF": round(vaf, 2),
-        "FP": round(fp, 2),
-        "Hours": round(hours, 1),
-        "hours_per_fp": hours_per_fp
-    }
-
-def estimate_use_case_points(features: List[str],
-                             simple_uc=5, avg_uc=8, complex_uc=3,
-                             simple_actor=3, avg_actor=3, complex_actor=1,
-                             tcf=0.9, ef=1.1, hours_per_ucp=20.0) -> Dict:
-    """
-    Simplified UCP:
-      UUCW = (5 * simple) + (10 * average) + (15 * complex)  [we map to counts directly]
-      UAW  = (1 * simple actors) + (2 * avg actors) + (3 * complex actors)
-      TCF, EF as inputs; UCP = (UUCW + UAW) * TCF * EF
-      Hours = UCP * hours_per_ucp
-    We default the counts based on features if the user hasn't changed them.
-    """
-    n = len(features)
-    # if unchanged defaults, derive some counts
-    if (simple_uc, avg_uc, complex_uc) == (5, 8, 3):
-        simple_uc = max(1, int(n * 0.5))
-        avg_uc = max(1, int(n * 0.35))
-        complex_uc = max(1, n - simple_uc - avg_uc)
-
-    if (simple_actor, avg_actor, complex_actor) == (3, 3, 1):
-        simple_actor = 3
-        avg_actor = 2 if n < 20 else 4
-        complex_actor = 1 if n < 30 else 2
-
-    uucw = (5*simple_uc) + (10*avg_uc) + (15*complex_uc)
-    uaw  = (1*simple_actor) + (2*avg_actor) + (3*complex_actor)
-    ucp  = (uucw + uaw) * tcf * ef
-    hours = ucp * hours_per_ucp
-
-    return {
-        "UUCW": uucw, "UAW": uaw, "TCF": tcf, "EF": ef,
-        "UCP": round(ucp, 2),
-        "Hours": round(hours, 1),
-        "counts": {
-            "simple_uc": simple_uc, "avg_uc": avg_uc, "complex_uc": complex_uc,
-            "simple_actor": simple_actor, "avg_actor": avg_actor, "complex_actor": complex_actor
-        },
-        "hours_per_ucp": hours_per_ucp
-    }
-
-def estimate_analogy(features: List[str], baseline_hours_per_feature=10.0, complexity_multiplier=1.0) -> Dict:
-    """
-    Analogy: hours ≈ features * baseline * multiplier
-    """
-    n = len(features)
-    hours = n * baseline_hours_per_feature * complexity_multiplier
-    return {
-        "Features": n,
-        "Baseline h/feature": baseline_hours_per_feature,
-        "Multiplier": complexity_multiplier,
-        "Hours": round(hours, 1)
-    }
-
-def estimate_expert_judgement(expert_hours=160.0, risk_multiplier=1.2) -> Dict:
-    """
-    Expert provides a base hours estimate, apply risk multiplier.
-    """
-    hours = expert_hours * risk_multiplier
-    return {
-        "Expert base hours": expert_hours,
-        "Risk multiplier": risk_multiplier,
-        "Hours": round(hours, 1)
-    }
-
-def ai_per_feature_estimates(features: List[str], hours_per_sp=8.0) -> Tuple[pd.DataFrame, Dict]:
-    """
-    AI-driven (or heuristic fallback) per-feature complexity -> SP -> hours.
-    Returns a dataframe + summary dict.
-    """
+def estimate_per_feature(features: List[str], hours_per_point: float = 8.0) -> List[Dict]:
     rows = []
     for f in features:
-        cplx, sp, why = ai_complexity_score(f)
-        cat = categorize_feature(f)
-        hours = sp * hours_per_sp
+        complexity, sp, rationale = classify_complexity(f)
+        hours = sp * hours_per_point
         rows.append({
             "Feature": f,
-            "Category": cat,
-            "AI Complexity": cplx,
+            "Category": categorize_feature(f),
+            "Complexity": complexity,
             "Story Points": sp,
-            "Hours": hours,
-            "Rationale": why
+            "Effort (hours)": hours,
+            "Rationale": rationale
         })
+    return rows
+
+# ---- Five techniques (deterministic formulas; no external APIs) ----
+def cocomo_estimation(size_kloc: float):
+    # COCOMO Basic (Organic defaults)
+    a, b = 2.4, 1.05
+    person_months = a * (size_kloc ** b)
+    # Convert PM to hours (assume 152 h per PM)
+    hours = person_months * 152.0
+    # Schedule in months
+    time_months = 2.5 * (person_months ** 0.38)
+    return max(hours, 0.0), max(time_months, 0.0)
+
+def function_point_estimation(fp_count: int, hours_per_fp: float = 5.0):
+    hours = fp_count * hours_per_fp
+    time_months = hours / (20.0 * 8.0)  # 20 workdays/month * 8h/day
+    return max(hours, 0.0), max(time_months, 0.0)
+
+def use_case_points_estimation(use_cases: int, hours_per_ucp: float = 10.0):
+    hours = use_cases * hours_per_ucp
+    time_months = hours / (20.0 * 8.0)
+    return max(hours, 0.0), max(time_months, 0.0)
+
+def expert_judgment_estimation(requirements_text: str):
+    words = len(requirements_text.split())
+    # heuristic: 1 hour / 12 words + base
+    hours = words / 12.0 + 24.0
+    time_months = hours / (20.0 * 8.0)
+    return max(hours, 0.0), max(time_months, 0.0)
+
+def ai_based_estimation(requirements_text: str):
+    # local NLP-ish heuristic: length, diversity, risk keywords
+    text = requirements_text.lower()
+    words = re.findall(r"[a-z0-9]+", text)
+    vocab = len(set(words))
+    risk_terms = sum(1 for w in words if w in {
+        "integration","pci","gdpr","hipaa","sso","oauth","kafka","etl","pipeline",
+        "realtime","encryption","microservice","kubernetes","ai","ml","compliance",
+        "migration","multi-tenant","stream","security"
+    })
+    base = len(words) / 11.5
+    complexity_boost = (vocab / max(len(words),1)) * 180
+    risk_boost = risk_terms * 7.5
+    hours = base + complexity_boost + risk_boost + 16.0
+    time_months = hours / (20.0 * 8.0)
+    return max(hours, 0.0), max(time_months, 0.0)
+
+# ---- Metrics & planning ----
+def compute_aggregate_metrics(rows: List[Dict],
+                              team_size: int,
+                              hours_per_day: float,
+                              sprint_days: int,
+                              contingency_pct: float) -> Dict:
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df, {"Hours": 0.0, "SP": 0, "counts": {"High":0,"Medium":0,"Low":0}}
+    total_hours = float(df["Effort (hours)"].sum()) if not df.empty else 0.0
+    contingency_hours = total_hours * (contingency_pct / 100.0)
+    grand_total = total_hours + contingency_hours
 
-    total_h = float(df["Hours"].sum())
-    total_sp = int(df["Story Points"].sum())
-    counts = df["AI Complexity"].value_counts().to_dict()
-    for k in ["High", "Medium", "Low"]:
-        counts.setdefault(k, 0)
+    weekly_capacity = team_size * hours_per_day * 5.0
+    weeks = (grand_total / weekly_capacity) if weekly_capacity > 0 else 0
+    sprints = math.ceil((weeks * 5.0) / sprint_days) if sprint_days > 0 else 0
 
-    return df, {"Hours": round(total_h,1), "SP": total_sp, "counts": counts}
+    n = len(rows)
+    high = int((df["Complexity"] == "High").sum()) if not df.empty else 0
+    low  = int((df["Complexity"] == "Low").sum()) if not df.empty else 0
+    confidence = min(0.95, 0.6 + (low * 0.01) + (n * 0.002) - (high * 0.005))
+    confidence = max(0.4, confidence)
 
-# ---------- Export helpers ----------
-def to_excel_bytes(sheets: Dict[str, pd.DataFrame], summary_text: str = "") -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, index=False, sheet_name=name[:31] or "Sheet1")
-        # Add a textual Summary sheet if requested
-        if summary_text:
-            df_sum = pd.DataFrame({"Summary":[summary_text]})
-            df_sum.to_excel(writer, index=False, sheet_name="Summary")
-    return output.getvalue()
+    by_complexity = df.groupby("Complexity")["Effort (hours)"].sum().to_dict() if not df.empty else {}
+    by_category   = df.groupby("Category")["Effort (hours)"].sum().to_dict() if not df.empty else {}
 
+    return {
+        "total_hours": round(total_hours, 1),
+        "contingency_hours": round(contingency_hours, 1),
+        "grand_total_hours": round(grand_total, 1),
+        "weekly_capacity": round(weekly_capacity, 1),
+        "duration_weeks": round(weeks, 2),
+        "sprints": int(sprints),
+        "by_complexity": by_complexity,
+        "by_category": by_category,
+        "confidence": round(confidence * 100, 1),
+        "counts": {
+            "features": n,
+            "high": int(high),
+            "low": int(low),
+            "medium": int((df["Complexity"] == "Medium").sum()) if not df.empty else 0
+        }
+    }
+
+def suggest_team_and_plan(total_hours: float, hours_per_day: float, sprint_days: int):
+    # Assume team members available 5 days/week
+    # Start with minimal cross-functional team, scale by workload
+    base_team = {"Project Manager": 1, "Business Analyst": 1, "Developers": 2, "QA Engineers": 1, "DevOps": 1}
+    # Scale dev & QA with workload
+    scale = max(0, total_hours - 400) / 200.0
+    add_devs = int(scale * 1.2)
+    add_qas  = max(0, int(scale * 0.6))
+    team = base_team.copy()
+    team["Developers"] += add_devs
+    team["QA Engineers"] += add_qas
+
+    weekly_capacity = (sum(team.values()) * hours_per_day * 5.0)
+    sprint_capacity = weekly_capacity * (sprint_days / 5.0)
+    sprints = max(1, math.ceil(total_hours / max(sprint_capacity, 1.0)))
+    return team, sprints
+
+# ---- Export helpers ----
 def fig_to_png_bytes(fig) -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
     buf.seek(0)
     return buf.getvalue()
 
-def to_pdf_bytes(summary_lines: List[str], charts: List[bytes], tables: Dict[str, pd.DataFrame]) -> bytes:
-    if not FPDF:
-        content = "Install 'fpdf' to enable proper PDF export.\n\n" + "\n".join(summary_lines)
-        return content.encode("utf-8")
+def to_excel_bytes(estimation_df: pd.DataFrame,
+                   technique_df: pd.DataFrame,
+                   summary: Dict) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        estimation_df.to_excel(writer, index=False, sheet_name="Per-Feature Estimation")
+        technique_df.to_excel(writer, sheet_name="Techniques", index=True)
+        s = pd.DataFrame({
+            "Metric": [
+                "Total (hours)", "Contingency (hours)", "Grand Total (hours)",
+                "Weekly Capacity (hours)", "Duration (weeks)", "Sprints (est.)",
+                "Confidence (%)", "Feature Count"
+            ],
+            "Value": [
+                summary["total_hours"], summary["contingency_hours"], summary["grand_total_hours"],
+                summary["weekly_capacity"], summary["duration_weeks"], summary["sprints"],
+                summary["confidence"], summary["counts"]["features"]
+            ]
+        })
+        s.to_excel(writer, index=False, sheet_name="Summary")
+    return output.getvalue()
 
-    pdf = FPDF(orientation="P", unit="mm", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=12)
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, "Effort Estimation Report", ln=1)
-    pdf.set_font("Arial", "", 11)
-    pdf.multi_cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+def to_pdf_bytes(lines: List[str],
+                 charts_bytes: List[bytes],
+                 tables: Dict[str, pd.DataFrame]) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=24)
+    styles = getSampleStyleSheet()
+    story = []
 
-    pdf.ln(2)
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 8, "Summary", ln=1)
-    pdf.set_font("Arial", "", 11)
-    for ln in summary_lines:
-        pdf.multi_cell(0, 6, ln)
+    story.append(Paragraph("<b>Effort Estimation Report</b>", styles["Title"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(datetime.now().strftime("%Y-%m-%d %H:%M"), styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    for ln in lines:
+        story.append(Paragraph(ln, styles["Normal"]))
+    story.append(Spacer(1, 12))
 
     # Charts
-    for i, chart_bytes in enumerate(charts):
-        pdf.add_page()
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(0, 8, f"Chart {i+1}", ln=1)
-        img_path = f"chart_{i}.png"
-        with open(img_path, "wb") as f:
-            f.write(chart_bytes)
-        pdf.image(img_path, w=185)
+    for i, ch in enumerate(charts_bytes):
+        img = RLImage(io.BytesIO(ch), width=500, height=280)
+        story.append(Spacer(1, 8))
+        story.append(img)
 
-    # Tables (first 25 rows each)
-    for name, df in tables.items():
-        pdf.add_page()
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(0, 8, name, ln=1)
-        pdf.set_font("Arial", "", 10)
-        if df.empty:
-            pdf.multi_cell(0, 5, "(no rows)")
-            continue
-        show = df.head(25).copy()
-        for _, row in show.iterrows():
-            pdf.multi_cell(0, 5, " - " + ", ".join([f"{col}: {row[col]}" for col in show.columns[:6]]))
+    # Tables
+    for title, df in tables.items():
+        story.append(PageBreak())
+        story.append(Paragraph(f"<b>{title}</b>", styles["Heading2"]))
+        story.append(Spacer(1, 8))
+        data = [df.columns.tolist()] + df.values.tolist()
+        table = Table(data, repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2c766")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.black),
+            ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("ALIGN", (0,0), (-1,0), "CENTER"),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.HexColor("#fff6d6")]),
+        ]))
+        story.append(table)
 
-    out = pdf.output(dest="S").encode("latin-1", errors="ignore")
-    return out
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
 
-# =========================================================
-# ===================== SIDEBAR ===========================
-# =========================================================
+# ---- Help text for each technique ----
+HELP = {
+    "COCOMO": """<b>COCOMO</b> estimates based on code size (KLOC).
+Example: 12 KLOC (organic) → PM ≈ 2.4 * 12^1.05; Hours ≈ PM * 152; Schedule ≈ 2.5 * PM^0.38.""",
+    "Function Points": """<b>Function Points</b> count user-visible functions (inputs/outputs/files).
+Example: 120 FP with 5 h/FP → 600 hours.""",
+    "Use Case Points": """<b>Use Case Points</b> scale with number/complexity of use cases.
+Example: 25 UCP with 10 h/UCP → 250 hours.""",
+    "Expert Judgment": """<b>Expert Judgment</b> uses calibrated heuristics from similar projects.
+Example: CRM rework of similar size ~ 280 hours.""",
+    "AI-based NLP": """<b>AI-based NLP</b> (local heuristic): wordcount, vocabulary diversity & risk keywords
+(integrations, compliance, AI/ML) add effort to reflect hidden complexity."""
+}
+
+# -------------------- SIDEBAR: PARAMETERS --------------------
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
-
-    # Technique selection
-    st.markdown("**Estimation Techniques**")
-    use_cocomo = st.checkbox("COCOMO (Basic)")
-    use_fp = st.checkbox("Function Points")
-    use_ucp = st.checkbox("Use Case Points")
-    use_analogy = st.checkbox("Analogy-based")
-    use_expert = st.checkbox("Expert Judgment")
-    use_ai = st.checkbox("AI-based NLP (optional)")
+    team_size = st.number_input("Team size (FTE) (for metrics)", 1, 50, 5)
+    hours_per_day = st.number_input("Hours per person/day", 1.0, 12.0, 7.0)
+    sprint_days = st.number_input("Sprint length (days)", 5, 20, 10)
+    hours_per_point = st.number_input("Hours per Story Point (per-feature table)", 4.0, 12.0, 8.0, step=0.5)
+    contingency_pct = st.slider("Contingency (%)", 0, 50, 20)
 
     st.markdown("---")
-    st.markdown("**Common Parameters**")
-    contingency_pct = st.slider("Contingency (%)", 0, 50, 20)
+    st.markdown("**Exports**")
     want_pdf = st.checkbox("Enable PDF export", value=True)
     want_excel = st.checkbox("Enable Excel export", value=True)
 
-    st.markdown("---")
-    st.markdown("**COCOMO Inputs**")
-    cocomo_mode = st.selectbox("Mode", ["organic", "semi-detached", "embedded"])
-    avg_loc_per_feature = st.number_input("Avg LOC / feature", 20, 2000, 250, step=10)
-
-    st.markdown("---")
-    st.markdown("**Function Point Inputs**")
-    fp_ei = st.number_input("EI count (or leave default)", 1, 999, 10)
-    fp_eo = st.number_input("EO count (or leave default)", 1, 999, 6)
-    fp_eq = st.number_input("EQ count (or leave default)", 1, 999, 4)
-    fp_ilf = st.number_input("ILF count (or leave default)", 1, 999, 5)
-    fp_eif = st.number_input("EIF count (or leave default)", 1, 999, 3)
-    fp_vaf = st.slider("Value Adjustment Factor (VAF)", 0.6, 1.4, 1.0, step=0.05)
-    fp_hours_per_fp = st.number_input("Hours per FP", 2.0, 20.0, 8.0, step=0.5)
-
-    st.markdown("---")
-    st.markdown("**Use Case Points Inputs**")
-    ucp_simple = st.number_input("Simple UCs", 0, 999, 5)
-    ucp_avg = st.number_input("Average UCs", 0, 999, 8)
-    ucp_complex = st.number_input("Complex UCs", 0, 999, 3)
-    actor_simple = st.number_input("Simple Actors", 0, 999, 3)
-    actor_avg = st.number_input("Average Actors", 0, 999, 3)
-    actor_complex = st.number_input("Complex Actors", 0, 999, 1)
-    ucp_tcf = st.slider("TCF (0.6–1.4)", 0.6, 1.4, 0.9, step=0.05)
-    ucp_ef = st.slider("EF (0.6–1.4)", 0.6, 1.4, 1.1, step=0.05)
-    ucp_hours_per = st.number_input("Hours per UCP", 5.0, 40.0, 20.0, step=1.0)
-
-    st.markdown("---")
-    st.markdown("**Analogy Inputs**")
-    an_hours_per_feature = st.number_input("Baseline hours / feature", 1.0, 80.0, 10.0, step=0.5)
-    an_multiplier = st.slider("Complexity multiplier", 0.5, 3.0, 1.0, step=0.1)
-
-    st.markdown("---")
-    st.markdown("**Expert Judgment Inputs**")
-    expert_hours = st.number_input("Expert base hours", 1.0, 10000.0, 160.0, step=1.0)
-    expert_risk = st.slider("Risk multiplier", 0.5, 3.0, 1.2, step=0.1)
-
-    st.markdown("---")
-    st.markdown("**AI-based NLP Inputs**")
-    ai_hours_per_sp = st.number_input("Hours per Story Point (AI)", 1.0, 16.0, 8.0, step=0.5)
-    st.caption("If a Transformer model can't be loaded on your host, the AI method will gracefully fallback to a heuristic.")
-
-# =========================================================
-# ===================== INPUT TABS ========================
-# =========================================================
+# -------------------- INPUT TABS --------------------
 tab_paste, tab_upload = st.tabs(["✍️ Paste Requirements", "📄 Upload Document"])
+requirements_text = ""
+trigger = False
 
 with tab_paste:
     with st.form("paste_form"):
-        text_input = st.text_area(
-            "Paste project requirements here:",
-            height=220,
-            placeholder="Paste bullet points, scope, modules, integrations..."
-        )
+        pasted = st.text_area("Paste project requirements:", height=220, placeholder="Paste bullet points, scope, modules, integrations…")
+        # Technique choices & help — in the same form to avoid double click
+        st.markdown("#### Select Estimation Techniques")
+        cols = st.columns([1,1,1,1,1])
+        with cols[0]:
+            t_cocomo = st.checkbox("COCOMO", value=True)
+            if st.button("❓", key="help_cocomo"):
+                st.info(HELP["COCOMO"], icon="ℹ️")
+        with cols[1]:
+            t_fp = st.checkbox("Function Points", value=True)
+            if st.button("❓", key="help_fp"):
+                st.info(HELP["Function Points"], icon="ℹ️")
+        with cols[2]:
+            t_ucp = st.checkbox("Use Case Points", value=True)
+            if st.button("❓", key="help_ucp"):
+                st.info(HELP["Use Case Points"], icon="ℹ️")
+        with cols[3]:
+            t_expert = st.checkbox("Expert Judgment", value=True)
+            if st.button("❓", key="help_expert"):
+                st.info(HELP["Expert Judgment"], icon="ℹ️")
+        with cols[4]:
+            t_ai = st.checkbox("AI-based NLP", value=True)
+            if st.button("❓", key="help_ai"):
+                st.info(HELP["AI-based NLP"], icon="ℹ️")
+
         submitted_paste = st.form_submit_button("🔍 Generate Estimation", use_container_width=True)
+        if submitted_paste and pasted.strip():
+            requirements_text = pasted.strip()
+            trigger = True
+            techniques_selected = {
+                "COCOMO": t_cocomo, "Function Points": t_fp, "Use Case Points": t_ucp,
+                "Expert Judgment": t_expert, "AI-based NLP": t_ai
+            }
 
 with tab_upload:
     with st.form("upload_form"):
         file = st.file_uploader("Upload a document (.txt, .docx, .pdf)", type=["txt", "docx", "pdf"])
+        # Technique choices & help — mirror the paste form
+        st.markdown("#### Select Estimation Techniques")
+        cols2 = st.columns([1,1,1,1,1])
+        with cols2[0]:
+            u_cocomo = st.checkbox("COCOMO ", key="u_cocomo", value=True)
+            if st.button("❓ ", key="help_cocomo_u"):
+                st.info(HELP["COCOMO"], icon="ℹ️")
+        with cols2[1]:
+            u_fp = st.checkbox("Function Points ", key="u_fp", value=True)
+            if st.button("❓  ", key="help_fp_u"):
+                st.info(HELP["Function Points"], icon="ℹ️")
+        with cols2[2]:
+            u_ucp = st.checkbox("Use Case Points ", key="u_ucp", value=True)
+            if st.button("❓   ", key="help_ucp_u"):
+                st.info(HELP["Use Case Points"], icon="ℹ️")
+        with cols2[3]:
+            u_expert = st.checkbox("Expert Judgment ", key="u_expert", value=True)
+            if st.button("❓    ", key="help_expert_u"):
+                st.info(HELP["Expert Judgment"], icon="ℹ️")
+        with cols2[4]:
+            u_ai = st.checkbox("AI-based NLP ", key="u_ai", value=True)
+            if st.button("❓     ", key="help_ai_u"):
+                st.info(HELP["AI-based NLP"], icon="ℹ️")
+
         submitted_upload = st.form_submit_button("🔍 Generate Estimation", use_container_width=True)
+        if submitted_upload and file:
+            requirements_text = read_document(file).strip()
+            trigger = True
+            techniques_selected = {
+                "COCOMO": u_cocomo, "Function Points": u_fp, "Use Case Points": u_ucp,
+                "Expert Judgment": u_expert, "AI-based NLP": u_ai
+            }
 
-# Single-click decision
-requirements_text = ""
-trigger = False
-if submitted_paste and text_input.strip():
-    requirements_text = text_input.strip()
-    trigger = True
-elif submitted_upload and file:
-    requirements_text = read_document(file).strip()
-    trigger = True
-
-# =========================================================
-# ===================== RUN ESTIMATION ====================
-# =========================================================
+# -------------------- RUN ESTIMATION (single click via forms) --------------------
 if trigger and requirements_text:
     st.markdown("### 🔧 Processing")
-    st.markdown('<div class="card">We’re extracting features, applying selected estimation models, and computing capacity & schedule metrics.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card">Extracting features, applying selected techniques, and computing capacity & schedule metrics.</div>', unsafe_allow_html=True)
 
-    # Extract candidate features (fast heuristic)
+    # Identify features and per-feature baseline
     features = basic_feature_split(requirements_text)
     if not features:
         st.warning("Couldn’t extract features. Please refine the requirements.")
     else:
-        # Container to collect results
-        rows_summary = []   # for chart + summary table
-        sheets = {}         # for Excel export
-        charts_bytes = []   # for PDF export
+        per_feature_rows = estimate_per_feature(features, hours_per_point=hours_per_point)
+        per_feature_df = pd.DataFrame(per_feature_rows)
 
-        # ========== AI-based NLP (optional) ==========
-        ai_df = pd.DataFrame()
-        ai_total_hours = 0.0
-        if use_ai:
-            ai_df, ai_meta = ai_per_feature_estimates(features, hours_per_sp=ai_hours_per_sp)
-            ai_total_hours = ai_meta["Hours"]
-            rows_summary.append(["AI-based NLP", ai_total_hours])
-            # Save sheet
-            sheets["AI-based (per-feature)"] = ai_df
+        # Techniques
+        results = {}
+        # Simple proxies from text to numeric inputs
+        approx_kloc = max(1, int(len(re.findall(r"[a-z0-9]+", requirements_text.lower())) / 45))  # rough
+        approx_fp   = max(10, int(len(features) * 8))  # 8 FP per feature (heuristic)
+        approx_ucp  = len(features)
 
-        # ========== COCOMO ==========
-        if use_cocomo:
-            cocomo = estimate_cocomo(features, avg_loc_per_feature, cocomo_mode)
-            rows_summary.append(["COCOMO ("+cocomo_mode+")", cocomo["Hours"]])
-            sheets["COCOMO"] = pd.DataFrame([cocomo])
+        if techniques_selected.get("COCOMO"):
+            hrs, months = cocomo_estimation(approx_kloc)
+            results["COCOMO"] = {"effort": round(hrs, 1), "time_months": round(months, 2)}
 
-        # ========== Function Points ==========
-        if use_fp:
-            fp = estimate_function_points(features,
-                                          ei=fp_ei, eo=fp_eo, eq=fp_eq, ilf=fp_ilf, eif=fp_eif,
-                                          vaf=fp_vaf, hours_per_fp=fp_hours_per_fp)
-            rows_summary.append(["Function Points", fp["Hours"]])
-            sheets["Function Points"] = pd.DataFrame([fp])
+        if techniques_selected.get("Function Points"):
+            hrs, months = function_point_estimation(approx_fp, hours_per_fp=5.0)
+            results["Function Points"] = {"effort": round(hrs, 1), "time_months": round(months, 2)}
 
-        # ========== Use Case Points ==========
-        if use_ucp:
-            ucp = estimate_use_case_points(features,
-                                           simple_uc=ucp_simple, avg_uc=ucp_avg, complex_uc=ucp_complex,
-                                           simple_actor=actor_simple, avg_actor=actor_avg, complex_actor=actor_complex,
-                                           tcf=ucp_tcf, ef=ucp_ef, hours_per_ucp=ucp_hours_per)
-            rows_summary.append(["Use Case Points", ucp["Hours"]])
-            sheets["Use Case Points"] = pd.DataFrame([ucp])
+        if techniques_selected.get("Use Case Points"):
+            hrs, months = use_case_points_estimation(approx_ucp, hours_per_ucp=10.0)
+            results["Use Case Points"] = {"effort": round(hrs, 1), "time_months": round(months, 2)}
 
-        # ========== Analogy ==========
-        if use_analogy:
-            an = estimate_analogy(features, baseline_hours_per_feature=an_hours_per_feature, complexity_multiplier=an_multiplier)
-            rows_summary.append(["Analogy", an["Hours"]])
-            sheets["Analogy"] = pd.DataFrame([an])
+        if techniques_selected.get("Expert Judgment"):
+            hrs, months = expert_judgment_estimation(requirements_text)
+            results["Expert Judgment"] = {"effort": round(hrs, 1), "time_months": round(months, 2)}
 
-        # ========== Expert Judgment ==========
-        if use_expert:
-            ej = estimate_expert_judgement(expert_hours=expert_hours, risk_multiplier=expert_risk)
-            rows_summary.append(["Expert Judgment", ej["Hours"]])
-            sheets["Expert Judgment"] = pd.DataFrame([ej])
+        if techniques_selected.get("AI-based NLP"):
+            hrs, months = ai_based_estimation(requirements_text)
+            results["AI-based NLP"] = {"effort": round(hrs, 1), "time_months": round(months, 2)}
 
-        # If user forgot to pick any technique
-        if not rows_summary:
-            st.error("⚠️ Please select at least one estimation technique from the sidebar.")
+        if not results:
+            st.error("Please select at least one estimation technique.")
         else:
-            # Combine + add contingency and key metrics
-            comp_df = pd.DataFrame(rows_summary, columns=["Technique", "Base Hours"])
-            comp_df["With Contingency"] = comp_df["Base Hours"] * (1.0 + contingency_pct/100.0)
+            # ---------- METRICS STRIP ----------
+            # Aggregate using per-feature baseline + contingency etc.
+            summary = compute_aggregate_metrics(per_feature_rows, team_size, hours_per_day, sprint_days, contingency_pct)
 
-            total_base = float(comp_df["Base Hours"].mean())  # average across selected techniques
-            total_with_cont = float(comp_df["With Contingency"].mean())
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown('<div class="metric-box"><h3>Total Hours</h3><h2>{}</h2></div>'.format(summary["total_hours"]), unsafe_allow_html=True)
+            with c2:
+                st.markdown('<div class="metric-box"><h3>Grand Total (+{}%)</h3><h2>{}</h2></div>'.format(contingency_pct, summary["grand_total_hours"]), unsafe_allow_html=True)
+            with c3:
+                st.markdown('<div class="metric-box"><h3>Duration (weeks)</h3><h2>{}</h2></div>'.format(summary["duration_weeks"]), unsafe_allow_html=True)
+            with c4:
+                st.markdown('<div class="metric-box"><h3>Confidence</h3><h2>{}%</h2></div>'.format(summary["confidence"]), unsafe_allow_html=True)
 
-            # ========== METRICS STRIP ==========
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown('<div class="metric-box"><h3>Avg Base Hours (across chosen)</h3><h2>{}</h2></div>'.format(round(total_base,1)), unsafe_allow_html=True)
-            with col2:
-                st.markdown('<div class="metric-box"><h3>Avg + Contingency ({}%)</h3><h2>{}</h2></div>'.format(contingency_pct, round(total_with_cont,1)), unsafe_allow_html=True)
-            with col3:
-                st.markdown('<div class="metric-box"><h3>Features Detected</h3><h2>{}</h2></div>'.format(len(features)), unsafe_allow_html=True)
+            # ---------- IDENTIFIED FEATURES ----------
+            st.markdown("### 🧩 Identified Features")
+            st.write(", ".join(features[:40]) + (" ..." if len(features) > 40 else ""))
 
-            # ========== DETAIL TABLES ==========
-            st.markdown("### 📋 Technique Comparison")
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+            # ---------- PER-FEATURE TABLE ----------
+            st.markdown("### 📋 Per-Feature Estimation (Heuristic Baseline)")
+            st.dataframe(per_feature_df, use_container_width=True, hide_index=True)
 
-            # ========== CHARTS ==========
-            import matplotlib.pyplot as plt
+            # ---------- TECHNIQUE RESULTS ----------
+            st.markdown("### 🧪 Technique Results")
+            tech_df = pd.DataFrame(results).T.rename(columns={"effort":"Effort (hours)", "time_months":"Time (months)"})
+            st.dataframe(tech_df, use_container_width=True)
 
-            # Bar chart of estimates
+            # ---------- CHARTS ----------
+            charts_bytes = []
+
+            # Bar: Effort by Technique
             fig1, ax1 = plt.subplots()
-            ax1.bar(comp_df["Technique"], comp_df["With Contingency"])
-            ax1.set_title("Estimated Hours (with Contingency)")
+            tech_df["Effort (hours)"].plot(kind="bar", ax=ax1)
             ax1.set_ylabel("Hours")
-            ax1.set_xticklabels(comp_df["Technique"], rotation=20, ha="right")
+            ax1.set_title("Effort by Technique")
             st.pyplot(fig1, use_container_width=True)
             charts_bytes.append(fig_to_png_bytes(fig1))
 
-            # If AI per-feature available, show complexity mix pie
-            if use_ai and not ai_df.empty:
-                st.markdown("### 🧩 AI Complexity Mix")
-                mix = ai_df["AI Complexity"].value_counts().to_dict()
-                labels = list(mix.keys())
-                vals = list(mix.values())
+            # Pie: Per-feature Functional vs Non-Functional (baseline hours)
+            st.markdown("### 🧭 Functional vs Non-Functional (Baseline)")
+            by_cat = per_feature_df.groupby("Category")["Effort (hours)"].sum()
+            if not by_cat.empty:
                 fig2, ax2 = plt.subplots()
-                ax2.pie(vals, labels=labels, autopct="%1.1f%%", startangle=130)
-                ax2.set_title("AI-Detected Complexity Distribution")
+                ax2.pie(by_cat.values, labels=by_cat.index, autopct="%1.1f%%", startangle=140)
+                ax2.set_title("Effort by Category")
                 st.pyplot(fig2, use_container_width=True)
                 charts_bytes.append(fig_to_png_bytes(fig2))
 
-                # Cumulative hours curve
-                st.markdown("### ⏱️ AI Cumulative Effort (Top 30 Features)")
-                top = ai_df.head(30).copy()
-                top["Cum Hours"] = top["Hours"].cumsum()
+            # Line: Cumulative Effort over first 30 features
+            st.markdown("### ⏱️ Cumulative Effort (Top 30 Features)")
+            top = per_feature_df.head(30).copy()
+            if not top.empty:
+                top["Cum Hours"] = top["Effort (hours)"].cumsum()
                 fig3, ax3 = plt.subplots()
                 ax3.plot(range(1, len(top)+1), top["Cum Hours"], marker="o")
                 ax3.set_xlabel("Feature #")
                 ax3.set_ylabel("Cumulative Hours")
-                ax3.set_title("AI Cumulative Effort Curve")
+                ax3.set_title("Cumulative Effort Curve")
                 st.pyplot(fig3, use_container_width=True)
                 charts_bytes.append(fig_to_png_bytes(fig3))
 
-            # ========== DEFENSE NOTES ==========
+            # ---------- TEAM & SPRINT PLAN ----------
+            st.markdown("### 👥 Team & Sprint Plan (Suggestion)")
+            team_suggestion, sprints_needed = suggest_team_and_plan(summary["grand_total_hours"], hours_per_day, sprint_days)
+            colA, colB = st.columns(2)
+            with colA:
+                st.write("**Suggested Team (FTE)**")
+                st.write(pd.DataFrame({"Role": list(team_suggestion.keys()), "Count": list(team_suggestion.values())}))
+            with colB:
+                st.write(f"**Estimated Sprints Needed:** {sprints_needed} (with sprint length {sprint_days} days)")
+
+            # ---------- DEFENSE NOTES ----------
             st.markdown("### 🛡️ Assumptions & Defense Notes")
-            bullets = [
-                f"Contingency set to **{contingency_pct}%** to offset unknowns and rework.",
-                f"COCOMO uses average LOC/feature = **{avg_loc_per_feature}** and **{cocomo_mode}** mode parameters.",
-                f"Function Points weights are simplified mid-weights; **Hours/FP = {fp_hours_per_fp}**; **VAF = {fp_vaf}**.",
-                f"Use Case Points assume **Hours/UCP = {ucp_hours_per}**, with TCF={ucp_tcf}, EF={ucp_ef}.",
-                f"Analogy baseline **{an_hours_per_feature} h/feature**, multiplier **{an_multiplier}**.",
-                f"Expert Judgment base **{expert_hours} h**, risk multiplier **{expert_risk}**.",
-                f"AI-based NLP uses a local zero-shot classifier if available; otherwise a keyword heuristic. **Hours/SP = {ai_hours_per_sp}**.",
-                "Final recommendation is based on the **average across selected techniques** to reduce single-model bias.",
-            ]
-            st.markdown('<div class="card">' + "<br/>".join(["• " + b for b in bullets]) + "</div>", unsafe_allow_html=True)
-
-            # ========== EXPORTS ==========
-            st.markdown("### 📦 Export")
-
-            # Prepare Excel sheets
-            sheets["Technique Comparison"] = comp_df
-            if use_ai and not ai_df.empty:
-                # also add AI summary sheet
-                ai_summary_df = pd.DataFrame([{
-                    "AI Hours": total_with_cont if use_ai else 0,
-                    "AI Base Hours": ai_total_hours,
-                    "Features": len(features),
-                    "High": int(ai_df["AI Complexity"].eq("High").sum()),
-                    "Medium": int(ai_df["AI Complexity"].eq("Medium").sum()),
-                    "Low": int(ai_df["AI Complexity"].eq("Low").sum())
-                }])
-                sheets["AI Summary"] = ai_summary_df
-
-            # Summary text for file exports
-            summary_text = (
-                f"Features detected: {len(features)}\n"
-                f"Avg base hours (selected techniques): {round(total_base,1)}\n"
-                f"Avg hours incl. contingency ({contingency_pct}%): {round(total_with_cont,1)}"
+            st.markdown(
+                f"""
+<div class="card">
+<span class="badge">Scope Assumptions</span><br/>
+• Hours/Story Point (baseline table) = <b>{hours_per_point}</b>.<br/>
+• Contingency = <b>{contingency_pct}%</b> to offset unknowns & rework.<br/>
+• Team Capacity = <b>{team_size} FTE × {hours_per_day} h/day × 5 days/week</b>.<br/><br/>
+<span class="badge">Technique Interpretation</span><br/>
+• <b>COCOMO</b> uses proxy KLOC from requirement size to reflect scale.<br/>
+• <b>FP</b> approximates 8 FP/feature (tunable).<br/>
+• <b>UCP</b> approximates 1 UCP/feature; weight can be adjusted.<br/>
+• <b>Expert Judgment</b> calibrated against text size (historical heuristic).<br/>
+• <b>AI-based NLP</b> boosts effort for risk keywords & diversity (integration/security/AI).<br/><br/>
+<span class="badge">Schedule Rationale</span><br/>
+• Estimated <b>{summary["duration_weeks"]} weeks</b> → about <b>{summary["sprints"]} sprints</b> ({sprint_days}d each).<br/><br/>
+<span class="badge">Confidence</span><br/>
+• Current confidence: <b>{summary["confidence"]}%</b> (improves with clearer requirements and SME validation).<br/>
+</div>
+                """,
+                unsafe_allow_html=True
             )
 
-            col_a, col_b = st.columns(2)
+            # ---------- EXPORTS ----------
+            st.markdown("### 📦 Export")
+            col_x, col_y = st.columns(2)
 
             if want_excel:
-                with col_a:
-                    xls_bytes = to_excel_bytes(sheets, summary_text=summary_text)
+                with col_x:
+                    xls_bytes = to_excel_bytes(per_feature_df, tech_df, summary)
                     st.download_button(
                         label="⬇️ Download Estimation (XLSX)",
                         data=xls_bytes,
@@ -677,24 +593,21 @@ if trigger and requirements_text:
                     )
 
             if want_pdf:
-                with col_b:
-                    # Build concise summary lines
+                with col_y:
+                    # Assemble lines + tables for PDF
                     lines = [
-                        f"Features detected: {len(features)}",
-                        f"Average Base Hours (across chosen): {round(total_base,1)}",
-                        f"Average + Contingency ({contingency_pct}%): {round(total_with_cont,1)}",
+                        f"Total Hours (baseline): {summary['total_hours']}",
+                        f"Grand Total (+{contingency_pct}%): {summary['grand_total_hours']}",
+                        f"Duration (weeks): {summary['duration_weeks']}",
+                        f"Sprints (est.): {summary['sprints']}",
+                        f"Confidence: {summary['confidence']}%",
+                        f"Features: {summary['counts']['features']} "
+                        f"(H:{summary['counts']['high']}, M:{summary['counts']['medium']}, L:{summary['counts']['low']})"
                     ]
-                    if use_ai and not ai_df.empty:
-                        cts = ai_df["AI Complexity"].value_counts().to_dict()
-                        lines.append(
-                            f"AI complexity counts -> High: {cts.get('High',0)}, "
-                            f"Medium: {cts.get('Medium',0)}, Low: {cts.get('Low',0)}"
-                        )
-
-                    tables_for_pdf = {"Technique Comparison": comp_df}
-                    if use_ai and not ai_df.empty:
-                        tables_for_pdf["AI (first 25 rows)"] = ai_df[["Feature","AI Complexity","Story Points","Hours"]]
-
+                    tables_for_pdf = {
+                        "Technique Results": tech_df.reset_index().rename(columns={"index":"Technique"}),
+                        "Per-Feature Estimation": per_feature_df
+                    }
                     pdf_bytes = to_pdf_bytes(lines, charts_bytes, tables_for_pdf)
                     st.download_button(
                         label="⬇️ Download Report (PDF)",
@@ -705,4 +618,4 @@ if trigger and requirements_text:
                     )
 
 else:
-    st.info("Paste requirements or upload a document, then click **Generate Estimation**.")
+    st.info("Paste requirements or upload a document, choose techniques, then click **Generate Estimation**.")
